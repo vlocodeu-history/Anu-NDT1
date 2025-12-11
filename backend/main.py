@@ -36,11 +36,14 @@ logger.setLevel(logging.INFO)
 
 app = FastAPI(title="OCR Nameplate Backend")
 
-origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://anu-ndt-1.vercel.app/"
-]
+allowed = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("VERCEL_URL") or ""
+if allowed:
+    origins = [o.strip() for o in allowed.split(",") if o.strip()]
+else:
+    origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +52,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/")
+def read_root():
+    return {"ok": True}
 
+@app.get("/products")
+def list_products():
+    data = supabase.table("products").select("*").execute()
+    return data.data
 # ─────────────────────────────
 # IMAGE PROCESSING
 # ─────────────────────────────
