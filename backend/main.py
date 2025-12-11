@@ -1,7 +1,10 @@
 # main.py
 from itertools import islice
-import os, logging,socket
+import os
+import logging
+import socket
 import uuid
+import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -10,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import httpx
-from google.cloud import vision
+from google.cloud import vision_v1
+from google.oauth2 import service_account
 from PIL import Image, ImageEnhance, ImageOps
 
 load_dotenv()
@@ -23,16 +27,13 @@ SUPABASE_KEY = os.getenv("ROLE_KEY")
 SUPABASE_TABLE = "products"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Be careful in production — don't log secrets. These prints are helpful while debugging.
 print("SUPABASE_URL =", SUPABASE_URL)
-print("SUPABASE_SERVICE_ROLE (first 10) =", (SUPABASE_KEY))
+print("SUPABASE_SERVICE_ROLE (first 10) =", (SUPABASE_KEY[:10] if SUPABASE_KEY else None))
 
 logger = logging.getLogger("ndt-image")
 logger.setLevel(logging.INFO)
-# Set Google credentials path
-##if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-    ## os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
-      ##  r"\image-extract-476710-c6a143e5254f.json"
-    ##)
+
 
 app = FastAPI(title="OCR Nameplate Backend")
 
@@ -52,14 +53,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 @app.get("/")
 def read_root():
     return {"ok": True}
+
 
 @app.get("/products")
 def list_products():
     data = supabase.table("products").select("*").execute()
     return data.data
+
+
 # ─────────────────────────────
 # IMAGE PROCESSING
 # ─────────────────────────────
@@ -69,7 +75,7 @@ def preprocess_image_to_tmp(upload_path: str) -> str:
     w, h = img.size
     pad = int(min(w, h) * 0.01)
     if pad > 0:
-        img = img.crop((pad, pad, w-pad, h-pad))
+        img = img.crop((pad, pad, w - pad, h - pad))
 
     img = ImageEnhance.Contrast(img).enhance(1.3)
     img = ImageEnhance.Sharpness(img).enhance(1.1)
@@ -92,10 +98,37 @@ def make_high_contrast(img: Image.Image) -> Image.Image:
 
 
 # ─────────────────────────────
-# GOOGLE VISION OCR
+#  VISION OCR
 # ─────────────────────────────
 def get_vision_client():
-    return vision.ImageAnnotatorClient()
+    """
+    Create a Google Vision client.
+
+    Preferred: set GOOGLE_APPLICATION_CREDENTIALS_JSON env var to the JSON contents of
+    the service account key (safe when stored in Render as a secret).
+    Fallback: use default ADC (e.g., GOOGLE_APPLICATION_CREDENTIALS file on local dev).
+    """
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if creds_json:
+        try:
+            info = json.loads(creds_json)
+            credentials = service_account.Credentials.from_service_account_info(info)
+            client = vision_v1.ImageAnnotatorClient(credentials=credentials)
+            logger.info("Vision client created from GOOGLE_APPLICATION_CREDENTIALS_JSON")
+            return client
+        except Exception as e:
+            logger.exception("Failed to create Vision client from env JSON: %s", e)
+            # re-raise so the error is visible in logs and raises a 500 for correct debugging
+            raise
+
+    # fallback to application default credentials (useful for local dev when GOOGLE_APPLICATION_CREDENTIALS points to a file)
+    try:
+        client = vision_v1.ImageAnnotatorClient()
+        logger.info("Vision client created using default credentials")
+        return client
+    except Exception as e:
+        logger.exception("Failed to create Vision client using default credentials: %s", e)
+        raise
 
 
 def ocr_image(pil_img: Image.Image, mode="document") -> str:
@@ -105,7 +138,8 @@ def ocr_image(pil_img: Image.Image, mode="document") -> str:
     with open(tmp, "rb") as f:
         content = f.read()
 
-    image = vision.Image(content=content)
+    # use vision_v1.Image wrapper
+    image = vision_v1.types.Image(content=content)
     client = get_vision_client()
 
     if mode == "document":
@@ -321,14 +355,11 @@ async def insert_product_to_supabase(
     except Exception as e:
         logger.exception("Unexpected error while contacting Supabase: %s", e)
         return {"ok": False, "reason": "unexpected", "error": str(e)}
- 
+
+
 # ─────────────────────────────
 # OCR BULK ENDPOINT
 # ─────────────────────────────
-
-from itertools import islice
-
-# ...
 
 @app.post("/ocr-bulk")
 async def ocr_bulk(files: List[UploadFile] = File(...)):
@@ -432,9 +463,10 @@ async def ocr_bulk(files: List[UploadFile] = File(...)):
         "results": results,
     }
 
+
 # ─────────────────────────────
 # HEALTH CHECK
 # ─────────────────────────────
-@app.get("/")
-def root():
+@app.get("/health")
+def root_health():
     return {"status": "OK", "message": "OCR backend live"}
