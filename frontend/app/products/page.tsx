@@ -3,6 +3,8 @@
 
 import { useEffect, useState } from "react";
 
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+
 type Product = {
   id: string;
   batch_id: string | null;
@@ -120,7 +122,7 @@ export default function ProductsPage() {
   // PATCH to your FastAPI
   async function saveField(id: string, field: string, value: string) {
     try {
-      const res = await fetch(`http://localhost:8000/products/${id}`, {
+      const res = await fetch(`${backendUrl}/ocr-bulk`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
