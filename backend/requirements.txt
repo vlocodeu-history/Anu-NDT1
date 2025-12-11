@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+google-cloud-vision
+python-dotenv
+Pillow
+supabase               # ✅ this is the current official client, not “supabase-py”
