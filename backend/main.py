@@ -36,15 +36,15 @@ logger.setLevel(logging.INFO)
 
 app = FastAPI(title="OCR Nameplate Backend")
 
-allowed = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("VERCEL_URL") or ""
-if allowed:
-    origins = [o.strip() for o in allowed.split(",") if o.strip()]
+_allowed = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("VERCEL_URL") or ""
+if _allowed:
+    origins = [o.strip() for o in _allowed.split(",") if o.strip()]
 else:
     origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
-
+print("Allowed origins:", origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,  # change if needed
