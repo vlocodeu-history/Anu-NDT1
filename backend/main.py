@@ -39,6 +39,7 @@ app = FastAPI(title="OCR Nameplate Backend")
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://anu-ndt-1.vercel.app/"
 ]
 
 app.add_middleware(
