@@ -4,3 +4,7 @@ google-cloud-vision
 python-dotenv
 Pillow
 supabase               # ✅ this is the current official client, not “supabase-py”
+httpx
+python-multipart
+python-jose        # optional if you use JWT
+psycopg2-binary    # optional if you connect directly to Postgres
