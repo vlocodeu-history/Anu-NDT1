@@ -109,7 +109,8 @@ def get_vision_client():
     Fallback: use default ADC (e.g., GOOGLE_APPLICATION_CREDENTIALS file on local dev).
     """
     creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if creds_json:
+    # Only try to load if it looks like real JSON data (starts with {) and isn't just whitespace
+    if creds_json and creds_json.strip() and creds_json.strip().startswith("{"):
         try:
             info = json.loads(creds_json)
             credentials = service_account.Credentials.from_service_account_info(info)
@@ -118,11 +119,23 @@ def get_vision_client():
             return client
         except Exception as e:
             logger.exception("Failed to create Vision client from env JSON: %s", e)
-            # re-raise so the error is visible in logs and raises a 500 for correct debugging
-            raise
+            # Don't raise here; fall back to trying file-based credentials if JSON failed/was garbage
+            logger.warning("Falling back to file-based credentials due to JSON error.")
+
+    # DEBUG: print all GOOGLE_ keys to see what is loaded
+    for k, v in os.environ.items():
+        if k.startswith("GOOGLE_"):
+            print(f"DEBUG ENV: {k} = {v}")
 
     # fallback to application default credentials (useful for local dev when GOOGLE_APPLICATION_CREDENTIALS points to a file)
     try:
+        # HARDCODED FALLBACK: If env var is missing, try the known file in root
+        if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            hardcoded_path = os.path.abspath("../image-extract-476710-c6a143e5254f.json")
+            if os.path.exists(hardcoded_path):
+                logger.info("Setting GOOGLE_APPLICATION_CREDENTIALS to hardcoded path: %s", hardcoded_path)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = hardcoded_path
+
         client = vision_v1.ImageAnnotatorClient()
         logger.info("Vision client created using default credentials")
         return client
@@ -162,8 +175,35 @@ def ocr_image(pil_img: Image.Image, mode="document") -> str:
 # ─────────────────────────────
 # PARSER HELPERS
 # ─────────────────────────────
+def is_valid_line(line: str) -> bool:
+    """
+    Returns False if the line looks like OCR noise/garbage.
+    Heuristic: high ratio of symbols vs alphanumeric, or very long tokens.
+    """
+    s = line.strip()
+    if not s:
+        return False
+    
+    # If it's very long with no spaces, it's likely noise
+    if len(s) > 40 and " " not in s:
+        return False
+
+    # Count alphanumeric vs "bad" symbols
+    # Allowed symbols in normal text: space, ., -, /, (, ), :, "
+    allowed_symbols = " .-/:()\"'"
+    bad_count = sum(1 for c in s if not c.isalnum() and c not in allowed_symbols)
+    
+    # If more than 30% of characters are weird symbols, reject it
+    if len(s) > 5 and (bad_count / len(s)) > 0.3:
+        return False
+
+    return True
+
+
 def normalize_lines(txt: str) -> List[str]:
-    return [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    # split lines, then filter out garbage
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    return [ln for ln in lines if is_valid_line(ln)]
 
 
 def looks_like_casting(line: str) -> bool:
@@ -172,6 +212,9 @@ def looks_like_casting(line: str) -> bool:
         return False
 
     up = s.upper()
+    # "T(" is often start of Temp, but if it has no digits it might be noise.
+    # We'll rely on extract_fields strictness for that.
+    
     plate_starters = ("SN", "S/N", "MODEL", "DN", "PN", "PT", "BODY", "DISC", "SEAT", "DATE", "WWW.")
     if up.startswith(plate_starters):
         return False
@@ -232,8 +275,10 @@ def extract_fields(lines: List[str]) -> dict:
             data["seat"] = ln
             continue
 
+        # STRICTER TEMP CHECK: must contain digits to be a valid temperature
         if data["temp"] is None and ("T(" in up or "°C" in up or up.startswith("T°")):
-            data["temp"] = ln
+            if any(c.isdigit() for c in ln):
+                data["temp"] = ln
             continue
 
         if data["date"] is None and up.startswith("DATE"):
@@ -368,100 +413,108 @@ async def ocr_bulk(files: List[UploadFile] = File(...)):
     - 1 row in Supabase per group of up to 3 images.
     - OCR + parse each image, then aggregate within the group.
     """
-    batch_id = str(uuid.uuid4())
-    results = []
-    product_no = 1
+    import traceback
+    try:
+        batch_id = str(uuid.uuid4())
+        results = []
+        product_no = 1
 
-    # helper to iterate in chunks of size n
-    def chunked(iterable, n):
-        it = iter(iterable)
-        while True:
-            chunk = list(islice(it, n))
-            if not chunk:
-                break
-            yield chunk
+        # helper to iterate in chunks of size n
+        def chunked(iterable, n):
+            it = iter(iterable)
+            while True:
+                chunk = list(islice(it, n))
+                if not chunk:
+                    break
+                yield chunk
 
-    # Group incoming files 3-by-3
-    for group in chunked(files, 3):
-        group_texts: List[str] = []
-        group_casting: List[str] = []
-        group_plate_lines: List[str] = []
-        group_images_json: List[Dict[str, Any]] = []
-        group_results = []
+        # Group incoming files 3-by-3
+        for group in chunked(files, 3):
+            group_texts: List[str] = []
+            group_casting: List[str] = []
+            group_plate_lines: List[str] = []
+            group_images_json: List[Dict[str, Any]] = []
+            group_results = []
 
-        # OCR each file in this group
-        for file in group:
-            tmp_path = f"upload_{uuid.uuid4()}.jpg"
-            try:
-                with open(tmp_path, "wb") as f:
-                    f.write(await file.read())
-
-                preprocessed = preprocess_image_to_tmp(tmp_path)
-                pil_img = Image.open(preprocessed)
-
-                text1 = ocr_image(pil_img, mode="document")
-                hc = make_high_contrast(pil_img)
-                text2 = ocr_image(hc, mode="document")
-
-                raw_text = (text1 or "") + "\n" + (text2 or "")
-                lines = normalize_lines(raw_text)
-                casting = [ln for ln in lines if looks_like_casting(ln)]
-                plate_lines = [ln for ln in lines if not looks_like_casting(ln)]
-
-                group_texts.append(raw_text)
-                group_casting.extend(casting)
-                group_plate_lines.extend(plate_lines)
-                group_images_json.append({"filename": file.filename})
-
-                # per-image debug info (not inserted)
-                group_results.append(
-                    {
-                        "file": file.filename,
-                        "raw_text": raw_text,
-                        "casting_lines": casting,
-                    }
-                )
-            finally:
+            # OCR each file in this group
+            for file in group:
+                tmp_path = f"upload_{uuid.uuid4()}.jpg"
                 try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                    with open(tmp_path, "wb") as f:
+                        f.write(await file.read())
 
-        # Now parse once per group (all plate lines merged)
-        parsed = extract_fields(group_plate_lines)
-        parsed = try_fill_from_casting(parsed, group_casting)
+                    preprocessed = preprocess_image_to_tmp(tmp_path)
+                    pil_img = Image.open(preprocessed)
 
-        # Join all texts and unique casting lines
-        combined_raw_text = "\n\n".join(group_texts)
-        unique_casting = list(dict.fromkeys(group_casting))  # preserve order
+                    text1 = ocr_image(pil_img, mode="document")
+                    hc = make_high_contrast(pil_img)
+                    text2 = ocr_image(hc, mode="document")
 
-        # Insert ONE row into Supabase for this group
-        supabase_res = await insert_product_to_supabase(
-            batch_id=batch_id,
-            product_no=product_no,
-            parsed=parsed,
-            raw_text=combined_raw_text,
-            casting_lines=unique_casting,
-            images_json=group_images_json,
-        )
+                    raw_text = (text1 or "") + "\n" + (text2 or "")
+                    lines = normalize_lines(raw_text)
+                    casting = [ln for ln in lines if looks_like_casting(ln)]
+                    plate_lines = [ln for ln in lines if not looks_like_casting(ln)]
 
-        results.append(
-            {
-                "product_no": product_no,
-                "files": [r["file"] for r in group_results],
-                "parsed": parsed,
-                "casting_lines": unique_casting,
-                "supabase": supabase_res,
-            }
-        )
+                    group_texts.append(raw_text)
+                    group_casting.extend(casting)
+                    group_plate_lines.extend(plate_lines)
+                    group_images_json.append({"filename": file.filename})
 
-        product_no += 1
+                    # per-image debug info (not inserted)
+                    group_results.append(
+                        {
+                            "file": file.filename,
+                            "raw_text": raw_text,
+                            "casting_lines": casting,
+                        }
+                    )
+                finally:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
 
-    return {
-        "batch_id": batch_id,
-        "count": len(results),  # number of products (groups)
-        "results": results,
-    }
+            # Now parse once per group (all plate lines merged)
+            parsed = extract_fields(group_plate_lines)
+            parsed = try_fill_from_casting(parsed, group_casting)
+
+            # Join all texts and unique casting lines
+            combined_raw_text = "\n\n".join(group_texts)
+            unique_casting = list(dict.fromkeys(group_casting))  # preserve order
+
+            # Insert ONE row into Supabase for this group
+            supabase_res = await insert_product_to_supabase(
+                batch_id=batch_id,
+                product_no=product_no,
+                parsed=parsed,
+                raw_text=combined_raw_text,
+                casting_lines=unique_casting,
+                images_json=group_images_json,
+            )
+
+            results.append(
+                {
+                    "product_no": product_no,
+                    "files": [r["file"] for r in group_results],
+                    "parsed": parsed,
+                    "casting_lines": unique_casting,
+                    "supabase": supabase_res,
+                    "images": group_images_json,
+                }
+            )
+
+            product_no += 1
+
+        return {
+            "batch_id": batch_id,
+            "count": len(results),  # number of products (groups)
+            "results": results,
+        }
+    except Exception as e:
+        logger.error("CRITICAL ERROR in /ocr-bulk: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────

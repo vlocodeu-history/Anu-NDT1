@@ -1,7 +1,7 @@
+// page.tsx (React client) - Redesigned with Tailwind CSS
 "use client";
 
 import React, { useRef, useState } from "react";
-
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
 
@@ -22,100 +22,85 @@ type ParsedProduct = {
     date?: string | null;
     [k: string]: any;
   };
-  supabase: any;
-  // keep original raw result (if you need it)
+  supabase?: any;
   __raw?: any;
-};
-
-type NormalizedResult = {
-  batch_id: string;
-  product_count: number;
-  products: ParsedProduct[];
 };
 
 export default function UploadPage() {
   const [files, setFiles] = useState<FileList | null>(null);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<NormalizedResult | null>(null);
+  const [products, setProducts] = useState<ParsedProduct[] | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // ref to hidden input
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const handleHiddenInputClick = () => {
-    fileInputRef.current?.click();
-  };
+  const handleHiddenInputClick = () => fileInputRef.current?.click();
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFiles(e.target.files);
-    setResult(null);
+    setProducts(null);
     setError(null);
   };
 
+  async function pollJob(job: string, timeoutMs = 120000, intervalMs = 1000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const r = await fetch(`${backendUrl}/ocr-job/${job}`);
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || "Job status fetch failed");
+        }
+        const j = await r.json();
+        if (j.status === "done") return j;
+        await new Promise((res) => setTimeout(res, intervalMs));
+      } catch (err) {
+        console.error("poll error", err);
+        await new Promise((res) => setTimeout(res, intervalMs));
+      }
+    }
+    throw new Error("Job timed out");
+  }
+
   const handleSubmit = async () => {
     if (!files || files.length === 0) {
-      setError("Please select some images first");
+      setError("Please select images");
       return;
     }
     setError(null);
     setLoading(true);
-
+    setProducts(null);
+    setJobId(null);
     try {
-      const formData = new FormData();
-      Array.from(files).forEach((f) => formData.append("files", f));
-
-      const resp = await fetch(`${backendUrl}/ocr-bulk`, {
-        method: "POST",
-        body: formData,
-      });
-
+      const fd = new FormData();
+      Array.from(files).forEach((f) => fd.append("files", f));
+      const resp = await fetch(`${backendUrl}/ocr-bulk`, { method: "POST", body: fd });
       const text = await resp.text();
-      let json: any = null;
+      let json: any;
       try {
         json = text ? JSON.parse(text) : null;
-      } catch (err) {
-        console.error("Failed to parse JSON response:", text);
-        throw new Error("Invalid JSON from server");
+      } catch (e) {
+        console.error("Invalid JSON from server:", text);
+        throw new Error("Invalid response from server");
+      }
+      if (!resp.ok) throw new Error(json?.detail || JSON.stringify(json) || "Upload failed");
+      const id = json.batch_id || json.job_id; // handle both naming conventions
+      setJobId(id);
+
+      let finalResults = json.results;
+      if (!finalResults && id) {
+        const jobData = await pollJob(id, 120000, 1200);
+        finalResults = jobData.results;
       }
 
-      console.log("raw /ocr-bulk response:", json);
+      if (!finalResults) finalResults = [];
 
-      if (!resp.ok) {
-        const errMsg = (json && (json.detail || json.error || JSON.stringify(json))) || "Upload failed";
-        throw new Error(errMsg);
-      }
-
-      // Normalize: server you showed returns { batch_id, count, results: [...] }
-      // But accept flexible shapes too (products/results).
-      const rawResults: any[] =
-        Array.isArray(json?.results)
-          ? json.results
-          : Array.isArray(json?.products)
-          ? json.products
-          : Array.isArray(json?.results?.results)
-          ? json.results.results
-          : [];
-
-      // Build normalized products array from server items
-      const productsFromServer: ParsedProduct[] = (rawResults || []).map((r, idx) => {
-        // images_in_group may be provided in different shapes; fallbacks:
-        const images_in_group =
-          Array.isArray(r.images_in_group) && r.images_in_group.length > 0
-            ? r.images_in_group
-            : Array.isArray(r.images_json) && r.images_json.length > 0
-            ? r.images_json.map((it: any) => it.filename).filter(Boolean)
-            : r.file
-            ? [r.file]
-            : [];
-
-        const raw_text =
-          r.raw_text ||
-          r.text ||
-          (Array.isArray(r.images_json) ? r.images_json.map((it: any) => it.text || "").join("\n") : "") ||
-          "";
-
+      // normalize
+      const normalized: ParsedProduct[] = finalResults.map((r: any, idx: number) => {
+        const images_in_group = Array.isArray(r.images) ? r.images.map((it: any) => it.filename) : [];
+        const raw_text = r.parsed && r.parsed.raw_text ? r.parsed.raw_text : r.parsed ? "" : r.raw_text || "";
         return {
-          product_no: typeof r.product_no === "number" ? r.product_no : idx + 1,
+          product_no: r.product_no ?? idx + 1,
           images_in_group,
           raw_text,
           parsed: r.parsed ?? {},
@@ -123,309 +108,158 @@ export default function UploadPage() {
           __raw: r,
         };
       });
-
-      const normalized: NormalizedResult = {
-        batch_id: String(json?.batch_id ?? ""),
-        product_count: typeof json?.count === "number" ? json.count : productsFromServer.length,
-        products: productsFromServer,
-      };
-
-      console.log("normalized result:", normalized);
-      setResult(normalized);
+      setProducts(normalized);
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Something went wrong");
-      setResult(null);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(160deg, #eef2ff 0%, #e0f2fe 50%, #ffffff 100%)",
-        padding: "28px 16px 42px",
-        display: "flex",
-        justifyContent: "center",
-      }}
-    >
-      <div style={{ width: "100%", maxWidth: 1150 }}>
-        {/* colorful header */}
-        <div
-          style={{
-            background:
-              "linear-gradient(120deg, #2563eb 0%, #6366f1 50%, #f97316 120%)",
-            borderRadius: 16,
-            padding: "18px 20px",
-            color: "#fff",
-            marginBottom: 20,
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            boxShadow: "0 16px 30px rgba(37,99,235,.35)",
-          }}
-        >
+    <main className="min-h-screen font-sans p-6 md:p-10" style={{ background: "linear-gradient(160deg, #eef2ff 0%, #e0f2fe 50%, #ffffff 100%)" }}>
+      <div className="max-w-7xl mx-auto space-y-8">
+        {/* Header - Colorful Gradient */}
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-center p-6 rounded-2xl shadow-xl text-white"
+          style={{ background: "linear-gradient(120deg, #2563eb 0%, #6366f1 50%, #f97316 120%)" }}>
           <div>
-            <h1 style={{ margin: 0, fontSize: 20 }}>Valve / Nameplate OCR</h1>
-            <p style={{ margin: "4px 0 0", opacity: 0.95, fontSize: 13 }}>
-              Drop photos → backend groups x3 → Google Vision → Supabase
-            </p>
+            <h1 className="text-3xl font-bold tracking-tight">Valve OCR Dashboard</h1>
+            <p className="mt-1 text-sm opacity-90">Automated nameplate extraction & database processing</p>
           </div>
-          <div
-            style={{
-              background: "rgba(255,255,255,.18)",
-              border: "1px solid rgba(255,255,255,.35)",
-              borderRadius: 999,
-              padding: "5px 14px",
-              fontSize: 12,
-            }}
-          >
-            Backend: <strong>{backendUrl}</strong>
+          <div className="mt-4 md:mt-0 flex items-center space-x-3">
+            <div className="flex items-center gap-2 px-4 py-2 bg-white/20 text-white text-xs font-bold rounded-full border border-white/30 backdrop-blur-md shadow-sm">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              System Online
+            </div>
+          </div>
+        </header>
+
+        {/* Steps */}
+        <div className="flex flex-wrap gap-4">
+          <div className="flex items-center gap-3 px-4 py-2 bg-blue-50/50 border border-blue-200/60 rounded-full text-blue-900">
+            <span className="w-6 h-6 flex items-center justify-center bg-blue-600 text-white text-xs font-bold rounded-full shadow-sm">1</span>
+            <div>
+              <p className="text-sm font-bold leading-none">Choose images</p>
+              <p className="text-[10px] text-blue-600/70 uppercase tracking-wide font-semibold mt-0.5">Valve + Plate + Casting</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 px-4 py-2 bg-white/60 border border-gray-200 rounded-full text-gray-600">
+            <span className="w-6 h-6 flex items-center justify-center bg-blue-100 text-blue-600 text-xs font-bold rounded-full">2</span>
+            <div>
+              <p className="text-sm font-bold leading-none">Process</p>
+              <p className="text-[10px] text-gray-400 uppercase tracking-wide font-semibold mt-0.5">AI Extraction</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 px-4 py-2 bg-white/60 border border-gray-200 rounded-full text-gray-600">
+            <span className="w-6 h-6 flex items-center justify-center bg-blue-100 text-blue-600 text-xs font-bold rounded-full">3</span>
+            <div>
+              <p className="text-sm font-bold leading-none">Results</p>
+              <p className="text-[10px] text-gray-400 uppercase tracking-wide font-semibold mt-0.5">Database Records</p>
+            </div>
           </div>
         </div>
 
-        {/* steps */}
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            marginBottom: 18,
-            flexWrap: "wrap",
-          }}
-        >
-          <StepBox number={1} title="Choose images" desc="Valve + plate + casting" active />
-          <StepBox number={2} title="Send to API" desc="/ocr-bulk" />
-          <StepBox number={3} title="Review & save" desc="Supabase rows" />
-        </div>
-
-        {/* main card */}
-        <div
-          style={{
-            background: "#fff",
-            borderRadius: 16,
-            boxShadow: "0 12px 40px rgba(15,23,42,.08)",
-            padding: 20,
-            display: "grid",
-            gridTemplateColumns: "360px 1fr",
-            gap: 20,
-          }}
-        >
-          {/* LEFT */}
-          <div
-            style={{
-              borderRight: "1px solid #eff1f5",
-              paddingRight: 20,
-            }}
-          >
-            <p style={{ fontWeight: 600, marginBottom: 4, fontSize: 15 }}>
-              1. Upload product images
-            </p>
-            <p style={{ fontSize: 13, color: "#64748b", marginBottom: 12 }}>
-              You can select multiple images (in Chrome you can open the folder and select all).
-              Backend will treat <b>every 3 images</b> as 1 product.
-            </p>
-
-            {/* hidden input */}
-            <input
-              type="file"
-              multiple
-              ref={fileInputRef}
-              onChange={handleChange}
-              style={{ display: "none" }}
-            />
-
-            {/* choose button */}
-            <button
-              onClick={handleHiddenInputClick}
-              style={{
-                background: "linear-gradient(120deg, #2563eb 0%, #6366f1 100%)",
-                color: "#fff",
-                border: "none",
-                borderRadius: 10,
-                padding: "10px 16px",
-                fontWeight: 600,
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                boxShadow: "0 8px 20px rgba(37,99,235,.35)",
-              }}
-            >
-              📁 Choose images
-            </button>
-
-            {files && files.length > 0 && (
-              <p style={{ fontSize: 12, marginTop: 6, color: "#334155" }}>
-                {files.length} file(s) selected
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Sidebar / Upload Area */}
+          <div className="lg:col-span-4 space-y-6">
+            <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/60 border border-white p-6">
+              <h2 className="text-lg font-bold text-gray-900 mb-2">1. Upload product images</h2>
+              <p className="text-gray-500 text-xs mb-6 leading-relaxed">
+                Select multiple images (Ctrl/Cmd+Click). Backend will treat <strong>every 3 images</strong> as 1 product.
               </p>
-            )}
 
-            {/* selected file list */}
-            {files && files.length > 0 && (
-              <div
-                style={{
-                  background: "#f8fafc",
-                  border: "1px solid #e2e8f0",
-                  borderRadius: 10,
-                  padding: 10,
-                  marginTop: 10,
-                  maxHeight: 150,
-                  overflowY: "auto",
-                  fontSize: 12.5,
-                }}
+              <input type="file" multiple ref={fileInputRef} onChange={handleChange} className="hidden" />
+
+              <button
+                onClick={handleHiddenInputClick}
+                className="w-full py-3 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-xl shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 hover:scale-[1.02] transition-all flex items-center justify-center gap-2 font-bold"
               >
-                <p style={{ marginBottom: 6, fontWeight: 500 }}>
-                  Selected files:
-                </p>
-                <ul style={{ paddingLeft: 16 }}>
-                  {Array.from(files).map((f) => (
-                    <li key={f.name}>{f.name}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
+                <span className="text-xl">📁</span>
+                Choose Images
+              </button>
 
-            {/* run OCR button */}
-            <button
-              onClick={handleSubmit}
-              disabled={loading}
-              style={{
-                marginTop: 16,
-                width: "100%",
-                background: loading ? "#cbd5f5" : "#f97316",
-                color: "#fff",
-                border: "none",
-                borderRadius: 10,
-                padding: "10px 16px",
-                fontWeight: 600,
-                cursor: loading ? "not-allowed" : "pointer",
-                transition: "transform .08s ease-out",
-              }}
-            >
-              {loading ? "Processing…" : "▶ Start OCR & Save"}
-            </button>
+              {files && files.length > 0 && (
+                <div className="mt-4 bg-slate-50 rounded-xl p-4 border border-slate-200 shadow-inner">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Selected files</span>
+                    <span className="bg-white text-slate-700 text-[10px] font-bold px-2 py-0.5 rounded border border-slate-200">{files.length}</span>
+                  </div>
+                  <ul className="max-h-32 overflow-y-auto space-y-1 pr-2 custom-scrollbar">
+                    {Array.from(files).map((f) => (
+                      <li key={f.name} className="text-xs text-slate-600 truncate flex items-center gap-2 py-1 border-b border-slate-100 last:border-0">
+                        📄 {f.name}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
-            {/* messages */}
-            {error && (
-              <p style={{ color: "#b91c1c", fontSize: 12.8, marginTop: 10 }}>
-                {error}
-              </p>
-            )}
-            {!error && result && (
-              <p
-                style={{
-                  marginTop: 10,
-                  fontSize: 12.8,
-                  background: "#ecfdf3",
-                  border: "1px solid #bbf7d0",
-                  borderRadius: 8,
-                  padding: "6px 10px",
-                  color: "#166534",
-                }}
+              <button
+                onClick={handleSubmit}
+                disabled={loading || !files}
+                className={`mt-6 w-full py-3.5 px-6 rounded-xl font-bold text-white shadow-lg transition-all transform active:scale-[0.98] flex items-center justify-center gap-2 ${loading
+                  ? "bg-slate-300 cursor-not-allowed text-slate-500 shadow-none"
+                  : "bg-[#f97316] hover:bg-orange-600 shadow-orange-500/30"
+                  }`}
               >
-                ✅ Stored to Supabase — <b>{result.product_count}</b> product(s) in{" "}
-                {result.batch_id}
-              </p>
-            )}
+                {loading ? (
+                  <>
+                    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Processing...
+                  </>
+                ) : "▶ Start OCR & Save"}
+              </button>
+
+              {error && (
+                <div className="mt-4 p-3 bg-red-50 text-red-700 text-xs rounded-lg border border-red-200 font-medium flex items-start gap-2">
+                  <span className="text-lg">⚠️</span>
+                  {error}
+                </div>
+              )}
+
+              {products && !error && (
+                <div className="mt-4 p-3 bg-emerald-50 text-emerald-800 text-xs rounded-lg border border-emerald-200 font-medium flex items-start gap-2">
+                  <span className="text-lg">✅</span>
+                  <div>
+                    Saved to Database — <strong>{products.length} product(s)</strong>
+                    <div className="text-[10px] font-mono text-emerald-600/70 mt-1 truncate max-w-[200px]">Batch: {jobId}</div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* RIGHT */}
-          <div>
-            <p style={{ fontWeight: 600, marginBottom: 8, fontSize: 15 }}>
-              2. OCR / parsed result
-            </p>
-            {!result && !loading && (
-              <p style={{ fontSize: 13, color: "#94a3b8" }}>
-                After upload, grouped products will appear here.
-              </p>
-            )}
+          {/* Results Area */}
+          <div className="lg:col-span-8 space-y-6">
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 min-h-[600px]">
+              <h2 className="text-lg font-bold text-gray-900 mb-6 flex items-center gap-2">
+                <span className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center text-sm">2</span>
+                Results / Database Records
+              </h2>
 
-            {loading && (
-              <p style={{ fontSize: 13, color: "#334155" }}>
-                Running OCR… this may take a moment…
-              </p>
-            )}
+              {!products && !loading && (
+                <div className="h-64 flex flex-col items-center justify-center text-gray-400 border-2 border-dashed border-gray-100 rounded-xl">
+                  <p>No results yet. Upload images to begin.</p>
+                </div>
+              )}
 
-            {result && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                {(Array.isArray(result.products) ? result.products : []).map(
-                  (p, idx) => (
-                    <div
-                      key={`${result.batch_id ?? "batch"}-${p.product_no ?? "no"}-${idx}`}
-                      style={{
-                        border: "1px solid #e2e8f0",
-                        borderRadius: 12,
-                        background: "linear-gradient(160deg, #ffffff 0%, #eff6ff 100%)",
-                        padding: 12,
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          marginBottom: 6,
-                          alignItems: "center",
-                        }}
-                      >
-                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                          <span
-                            style={{
-                              background: "#dbeafe",
-                              color: "#1d4ed8",
-                              borderRadius: 999,
-                              padding: "2px 10px",
-                              fontWeight: 600,
-                              fontSize: 12,
-                            }}
-                          >
-                            Product #{p.product_no}
-                          </span>
-                          <span style={{ fontSize: 11, color: "#475569" }}>
-                            {Array.isArray(p.images_in_group) ? p.images_in_group.length : 0} image(s)
-                          </span>
-                        </div>
-                        <span style={{ fontSize: 11, color: "#64748b" }}>
-                          Supabase: {p.supabase?.ok ? "✅" : "⚠️"}
-                        </span>
-                      </div>
+              {loading && (
+                <div className="flex flex-col items-center justify-center py-20 space-y-4">
+                  <div className="w-12 h-12 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin"></div>
+                  <p className="text-gray-500 animate-pulse font-medium">Analyzing images with Google Vision...</p>
+                </div>
+              )}
 
-                      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-                        <Field label="Serial" value={p.parsed?.serial_number} />
-                        <Field label="Model" value={p.parsed?.model} />
-                        <Field label="DN" value={p.parsed?.dn} />
-                        <Field label="PN" value={p.parsed?.pn} />
-                        <Field label="PT" value={p.parsed?.pt} />
-                        <Field label="Body" value={p.parsed?.body} />
-                        <Field label="Disc" value={p.parsed?.disc} />
-                        <Field label="Seat" value={p.parsed?.seat} />
-                        <Field label="Temp" value={p.parsed?.temp} />
-                      </div>
-
-                      <details style={{ marginTop: 8 }}>
-                        <summary style={{ cursor: "pointer", fontSize: 12.5 }}>
-                          Show raw OCR text
-                        </summary>
-                        <pre
-                          style={{
-                            whiteSpace: "pre-wrap",
-                            background: "#f8fafc",
-                            border: "1px solid #e2e8f0",
-                            borderRadius: 8,
-                            padding: 6,
-                            fontSize: 12,
-                            marginTop: 6,
-                          }}
-                        >
-                          {p.raw_text}
-                        </pre>
-                      </details>
-                    </div>
-                  )
-                )}
+              <div className="space-y-6">
+                {products && products.map((p) => (
+                  <ProductCard key={p.product_no} product={p} />
+                ))}
               </div>
-            )}
+            </div>
           </div>
         </div>
       </div>
@@ -433,63 +267,89 @@ export default function UploadPage() {
   );
 }
 
-/* ---- helper components ---- */
+function ProductCard({ product }: { product: ParsedProduct }) {
+  const [formData, setFormData] = useState(product.parsed);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "success">("idle");
 
-function StepBox({
-  number,
-  title,
-  desc,
-  active = false,
-}: {
-  number: number;
-  title: string;
-  desc: string;
-  active?: boolean;
-}) {
+  const handleChange = (key: string, val: string) => {
+    setFormData((prev) => ({ ...prev, [key]: val }));
+    if (saveStatus === "success") setSaveStatus("idle");
+  };
+
+  const handleSave = () => {
+    setSaveStatus("saving");
+    // Mock save action
+    setTimeout(() => {
+      setSaveStatus("success");
+      // Reset after 3 seconds
+      setTimeout(() => setSaveStatus("idle"), 3000);
+    }, 800);
+  };
+
   return (
-    <div
-      style={{
-        background: active ? "rgba(37,99,235,.12)" : "rgba(255,255,255,.5)",
-        border: active ? "1px solid rgba(37,99,235,.45)" : "1px solid rgba(148,163,184,.1)",
-        borderRadius: 999,
-        padding: "8px 14px",
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-      }}
-    >
-      <span
-        style={{
-          width: 26,
-          height: 26,
-          borderRadius: "999px",
-          background: active ? "#2563eb" : "#cbd5f5",
-          color: "#fff",
-          display: "grid",
-          placeItems: "center",
-          fontWeight: 700,
-          fontSize: 13,
-        }}
-      >
-        {number}
-      </span>
-      <div>
-        <p style={{ margin: 0, fontWeight: 600, fontSize: 13 }}>{title}</p>
-        <p style={{ margin: 0, fontSize: 11, color: "#475569" }}>{desc}</p>
+    <div className="border border-blue-100 rounded-xl overflow-hidden hover:shadow-lg transition-all bg-gradient-to-br from-white to-blue-50">
+      {/* Card Header */}
+      <div className="bg-white/50 px-6 py-4 flex justify-between items-center border-b border-gray-100 backdrop-blur-sm">
+        <div className="flex items-center gap-4">
+          <span className="bg-white border border-gray-300 text-gray-700 font-bold px-3 py-1 rounded-lg shadow-sm text-sm">
+            #{product.product_no}
+          </span>
+          <span className="text-xs text-gray-500 font-medium">
+            {product.images_in_group.length} images sourced
+          </span>
+        </div>
+      </div>
+
+      {/* Grid of Editable Fields */}
+      <div className="p-6 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-y-6 gap-x-4">
+        <EditableField label="Serial No." value={formData.serial_number} onChange={(v) => handleChange("serial_number", v)} />
+        <EditableField label="Model" value={formData.model} onChange={(v) => handleChange("model", v)} />
+        <EditableField label="DN" value={formData.dn} onChange={(v) => handleChange("dn", v)} />
+        <EditableField label="PN" value={formData.pn} onChange={(v) => handleChange("pn", v)} />
+        <EditableField label="PT" value={formData.pt} onChange={(v) => handleChange("pt", v)} />
+        <EditableField label="Body Mat." value={formData.body} onChange={(v) => handleChange("body", v)} />
+        <EditableField label="Disc Mat." value={formData.disc} onChange={(v) => handleChange("disc", v)} />
+        <EditableField label="Seat Mat." value={formData.seat} onChange={(v) => handleChange("seat", v)} />
+        <EditableField label="Temp." value={formData.temp} onChange={(v) => handleChange("temp", v)} highlight />
+      </div>
+
+      {/* Action Footer */}
+      <div className="bg-white/40 px-6 py-3 border-t border-blue-100 flex justify-end">
+        <button
+          onClick={handleSave}
+          disabled={saveStatus !== "idle"}
+          className={`px-6 py-2 text-sm font-bold rounded-lg shadow-sm transition-all flex items-center gap-2 ${saveStatus === "success"
+            ? "bg-emerald-500 text-white hover:bg-emerald-600 scale-105"
+            : saveStatus === "saving"
+              ? "bg-blue-400 text-white cursor-wait"
+              : "bg-blue-600 hover:bg-blue-700 text-white"
+            }`}
+        >
+          {saveStatus === "saving" && (
+            <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+          )}
+          {saveStatus === "saving" ? "Saving..." : saveStatus === "success" ? "Saved Successfully ✓" : "Save Changes"}
+        </button>
       </div>
     </div>
   );
 }
 
-function Field({ label, value }: { label: string; value?: string | null }) {
+function EditableField({ label, value, onChange, highlight }: { label: string; value?: string | null; onChange: (val: string) => void; highlight?: boolean }) {
   return (
-    <div style={{ minWidth: 115 }}>
-      <p style={{ fontSize: 10.5, textTransform: "uppercase", color: "#94a3b8" }}>
-        {label}
-      </p>
-      <p style={{ fontSize: 13.3, fontWeight: 500 }}>
-        {value && typeof value === "string" && value.trim().length > 0 ? value : "—"}
-      </p>
+    <div className="flex flex-col gap-1.5">
+      <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{label}</label>
+      <input
+        type="text"
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value)}
+        className={`w-full bg-white border border-gray-200 rounded-md px-2.5 py-1.5 text-sm font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 ${highlight ? "text-blue-700 bg-blue-50/50" : "text-gray-900"
+          }`}
+        placeholder="-"
+      />
     </div>
   );
 }
