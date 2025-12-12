@@ -406,6 +406,11 @@ async def insert_product_to_supabase(
 # OCR BULK ENDPOINT
 # ─────────────────────────────
 
+# ─────────────────────────────
+# JOB STORAGE (In-Memory)
+# ─────────────────────────────
+JOBS = {}
+
 @app.post("/ocr-bulk")
 async def ocr_bulk(files: List[UploadFile] = File(...)):
     """
@@ -416,6 +421,9 @@ async def ocr_bulk(files: List[UploadFile] = File(...)):
     import traceback
     try:
         batch_id = str(uuid.uuid4())
+        # Initialize job status
+        JOBS[batch_id] = {"status": "processing", "results": []}
+        
         results = []
         product_no = 1
 
@@ -506,15 +514,34 @@ async def ocr_bulk(files: List[UploadFile] = File(...)):
 
             product_no += 1
 
-        return {
+        response_data = {
             "batch_id": batch_id,
             "count": len(results),  # number of products (groups)
             "results": results,
+            "status": "done"
         }
+        
+        # Update job storage
+        JOBS[batch_id] = response_data
+        
+        return response_data
+        
     except Exception as e:
         logger.error("CRITICAL ERROR in /ocr-bulk: %s", e)
         traceback.print_exc()
+        if 'batch_id' in locals():
+            JOBS[batch_id] = {"status": "failed", "error": str(e)}
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ocr-job/{job_id}")
+def get_job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        # If job not found, return failed 404 or just a "not found" status 
+        # to prevent frontend crash loop, we return 404
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 # ─────────────────────────────
